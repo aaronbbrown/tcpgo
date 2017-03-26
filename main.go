@@ -11,13 +11,19 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
 const (
 	ArpRequest = 1
 	ArpReply   = 2
+
+	ArpHwTypeEthernet = 0x0001
+)
+
+var (
+	req  ifReq
+	fTun *os.File
 )
 
 type ifReq struct {
@@ -58,6 +64,27 @@ func (eth *EthHdr) String() string {
 		bytes.Trim(eth.Payload, "\x00"))
 }
 
+func (eth *EthHdr) Copy() *EthHdr {
+	eth2 := &EthHdr{DstAddr: make(net.HardwareAddr, 6),
+		SrcAddr:   make(net.HardwareAddr, 6),
+		EtherType: eth.EtherType,
+		Payload:   make([]byte, len(eth.Payload))}
+
+	copy(eth2.DstAddr, eth.DstAddr)
+	copy(eth2.SrcAddr, eth.SrcAddr)
+
+	return eth2
+}
+
+func (eth *EthHdr) Marshal() []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, eth.DstAddr)
+	binary.Write(buf, binary.BigEndian, eth.SrcAddr)
+	binary.Write(buf, binary.BigEndian, eth.EtherType)
+	buf.Write(eth.Payload)
+	return buf.Bytes()
+}
+
 func (arp *arpHdr) String() string {
 	return fmt.Sprintf("[ARP HEADER] HwType: %x, ProType: %x, HwSize: %d, ProSize: %d, OpCode: %x, Data: %v",
 		arp.HwType,
@@ -76,21 +103,105 @@ func (a *arpIpv4) String() string {
 		a.DIP)
 }
 
-func (arp *arpHdr) Handle() error {
-	// this only does IP right now
+func (a *arpIpv4) Copy() *arpIpv4 {
+	a2 := &arpIpv4{SMAC: make(net.HardwareAddr, 6),
+		SIP:  make(net.IP, 4),
+		DMAC: make(net.HardwareAddr, 6),
+		DIP:  make(net.IP, 4)}
+
+	copy(a2.SMAC, a.SMAC)
+	copy(a2.SIP, a.SIP)
+	copy(a2.DMAC, a.DMAC)
+	copy(a2.DIP, a.DIP)
+	return a2
+}
+
+func (a *arpIpv4) Marshal() []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, a.SMAC)
+	binary.Write(buf, binary.LittleEndian, a.SIP)
+	binary.Write(buf, binary.BigEndian, a.DMAC)
+	binary.Write(buf, binary.LittleEndian, a.DIP)
+	return buf.Bytes()
+
+}
+
+func IpInAddrs(addrs []net.Addr, ip net.IP) bool {
+	for _, addr := range addrs {
+		addrIp, _, _ := net.ParseCIDR(addr.String())
+		if ip.Equal(addrIp) {
+			return true
+		}
+	}
+	return false
+}
+
+// eth is the original ethHdr
+func (arp *arpHdr) Handle(fTun *os.File, eth *EthHdr, netIf *net.Interface) (resp []byte, err error) {
+	if arp.HwType != ArpHwTypeEthernet {
+		return nil, fmt.Errorf("Unsupported HwType: %x", arp.HwType)
+	}
+
 	if arp.ProType != syscall.ETH_P_IP {
-		return fmt.Errorf("ProType not implemented: %x", arp.ProType)
+		return nil, fmt.Errorf("Unsupported ProType: %x", arp.ProType)
 	}
 
 	arpIpv4 := UnmarshalArpIpv4(arp.Data)
 	log.Println(arpIpv4)
+
+	// TODO implement ARP translation table cache
 	switch arp.OpCode {
 	case ArpRequest:
+		// is the DIP in my list of IPs for this interface
+		addrs, _ := netIf.Addrs()
+		if !IpInAddrs(addrs, arpIpv4.DIP) {
+			// not for me
+			return nil, nil
+		}
+		replyData := arpIpv4.Copy()
+		replyData.SIP, replyData.DIP = arpIpv4.DIP, arpIpv4.SIP
+		replyData.SMAC, replyData.DMAC = arpIpv4.DMAC, arpIpv4.SMAC
+
+		reply := arp.Copy()
+		reply.OpCode = ArpReply
+		reply.Data = replyData.Marshal()
+
+		ethReply := eth.Copy()
+		ethReply.SrcAddr, ethReply.DstAddr = eth.DstAddr, eth.SrcAddr
+		ethReply.Payload = reply.Marshal()
+
+		fmt.Println(ethReply)
+		fTun.Write(ethReply.Marshal())
+
 	default:
-		return fmt.Errorf("OpCode not implemented: %d", arp.OpCode)
+		return nil, fmt.Errorf("OpCode not implemented: %d", arp.OpCode)
 	}
 
-	return nil
+	return nil, nil
+}
+
+func (arp *arpHdr) Copy() *arpHdr {
+	arp2 := &arpHdr{
+		HwType:  arp.HwType,
+		ProType: arp.ProType,
+		HwSize:  arp.HwSize,
+		ProSize: arp.ProSize,
+		OpCode:  arp.OpCode,
+		Data:    make([]byte, len(arp.Data))}
+
+	copy(arp2.Data, arp.Data)
+	return arp2
+}
+
+func (arp *arpHdr) Marshal() []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, arp.HwType)
+	binary.Write(buf, binary.BigEndian, arp.ProType)
+	binary.Write(buf, binary.BigEndian, arp.HwSize)
+	binary.Write(buf, binary.BigEndian, arp.ProSize)
+	binary.Write(buf, binary.BigEndian, arp.OpCode)
+	buf.Write(arp.Data)
+	return buf.Bytes()
 }
 
 // Read 6 bytes from an io.Reader and return a MAC addr
@@ -203,11 +314,6 @@ func ifUp(dev string) error {
 	return exec.Command("ip", "link", "set", "tap0", "up").Run()
 }
 
-var (
-	req  ifReq
-	fTun *os.File
-)
-
 func main() {
 	fTun, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
 	if err != nil {
@@ -220,13 +326,19 @@ func main() {
 		log.Fatal("Could not allocate TAP: ", err)
 	}
 
-	log.Printf("Allocated TAP on %q", dev)
-	time.Sleep(time.Second)
-	if err := ifUp(dev); err != nil {
+	netIf, err := net.InterfaceByName(dev)
+	if err != nil {
+		log.Fatal("Could not get interface details: ", err)
+	}
+
+	log.Printf("Allocated TAP on %s", netIf)
+
+	if err := ifUp(netIf.Name); err != nil {
 		log.Fatal("Error configuring TAP interface: ", err)
 	}
 
 	r := bufio.NewReader(fTun)
+
 	for {
 		eth, err := UnmarshalEthHdr(r)
 		if err != nil {
@@ -238,13 +350,16 @@ func main() {
 		case syscall.ETH_P_ARP:
 			arp := UnmarshalArpHdr(eth.Payload)
 			log.Println(arp)
-			if err := arp.Handle(); err != nil {
+			resp, err := arp.Handle(fTun, eth, netIf)
+			if err != nil {
 				log.Printf("Error handling ARP packet: %v", err)
 			}
+			if resp == nil {
+				continue
+			}
+
 		default:
 			log.Printf("Unhandled EtherType: %x", eth.EtherType)
 		}
-
 	}
-
 }
