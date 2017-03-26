@@ -160,17 +160,17 @@ func (arp *arpHdr) Handle(fTun *os.File, eth *EthHdr, netIf *net.Interface) (res
 		}
 		replyData := arpIpv4.Copy()
 		replyData.SIP, replyData.DIP = arpIpv4.DIP, arpIpv4.SIP
-		replyData.SMAC, replyData.DMAC = arpIpv4.DMAC, arpIpv4.SMAC
+		replyData.SMAC, replyData.DMAC = netIf.HardwareAddr, arpIpv4.SMAC
+		fmt.Println(replyData)
 
 		reply := arp.Copy()
 		reply.OpCode = ArpReply
 		reply.Data = replyData.Marshal()
 
 		ethReply := eth.Copy()
-		ethReply.SrcAddr, ethReply.DstAddr = eth.DstAddr, eth.SrcAddr
+		ethReply.SrcAddr, ethReply.DstAddr = netIf.HardwareAddr, eth.SrcAddr
 		ethReply.Payload = reply.Marshal()
 
-		fmt.Println(ethReply)
 		fTun.Write(ethReply.Marshal())
 
 	default:
