@@ -161,7 +161,6 @@ func (arp *arpHdr) Handle(fTun *os.File, eth *EthHdr, netIf *net.Interface) (res
 		replyData := arpIpv4.Copy()
 		replyData.SIP, replyData.DIP = arpIpv4.DIP, arpIpv4.SIP
 		replyData.SMAC, replyData.DMAC = netIf.HardwareAddr, arpIpv4.SMAC
-		fmt.Println(replyData)
 
 		reply := arp.Copy()
 		reply.OpCode = ArpReply
@@ -172,6 +171,7 @@ func (arp *arpHdr) Handle(fTun *os.File, eth *EthHdr, netIf *net.Interface) (res
 		ethReply.Payload = reply.Marshal()
 
 		fTun.Write(ethReply.Marshal())
+		log.Println("[REPLY]", ethReply)
 
 	default:
 		return nil, fmt.Errorf("OpCode not implemented: %d", arp.OpCode)
@@ -311,7 +311,7 @@ func ifUp(dev string) error {
 		return err
 	}
 
-	return exec.Command("ip", "link", "set", "tap0", "up").Run()
+	return exec.Command("ip", "link", "set", dev, "up").Run()
 }
 
 func main() {
